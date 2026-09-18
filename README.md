@@ -2,6 +2,28 @@
 
 Reusable Terraform module for creating ECS services.
 
+## Architecture decisions
+
+### Terraform provisions the service, the CLI deploys it
+
+The `aws_ecs_service` ignores `desired_count`, `task_definition` and `load_balancer`, and the rollout itself is a `null_resource` local-exec — `aws ecs update-service`, or `aws deploy create-deployment` against a rendered appspec for blue/green — triggered by the task definition revision. Terraform owns the shape of the service; the CLI owns which revision is live. I rejected letting Terraform manage the live revision: the autoscaler rewrites `desired_count` and CodeDeploy rewrites the target group, so every plan after a deploy reports drift and every apply tries to shove traffic back to the last applied state. The price is that `terraform plan` shows a `null_resource` being replaced, never the service change itself.
+
+### Blue/green is a parallel resource set, not a flag
+
+Every CodeDeploy resource lives in its own `*_codedeploy.tf` file, behind a `count` gated on `var.deployment_controller == "CODE_DEPLOY"` — weighted rule, blue and green target groups, rollback alarm, role. The rule is created 100/0 and then carries `ignore_changes = [action]`, because after the first deployment CodeDeploy owns the weights. One parameterized rule shared by both controllers would put Terraform and CodeDeploy in a fight over the weights of the live production rule on every apply. I pay for this with three copies of the same `health_check` block.
+
+### Rollback fires on an error ratio, not an error count
+
+The rollback alarm is metric math: `(errBlue + errGreen) / (rqBlue + rqGreen) * 100`, over a 60-second period, with a 10% threshold by default. A raw `HTTPCode_Target_5XX_Count` on green alone is traffic-dependent — silent on a low-traffic service failing every request, noisy at peak — and reads only half the fleet during the shift. Since the default strategy is `ECSAllAtOnce`, traffic moves in one step, and `termination_wait_time_in_minutes = 5` deliberately keeps blue alive long enough for the alarm to evaluate.
+
+### Target group names are hashes
+
+`substr(sha256(...), 0, 32)` over service plus cluster, with `blue-`/`green-` folded into the hashed string. ALB target group names cap at 32 characters and must be unique per region, so readable `cluster-service` names break on exactly the longest pairs, at create time, mid-apply. The hash is deterministic, so the name is stable across applies. The cost: the console shows gibberish, and I find target groups through Terraform instead.
+
+### Capacity is a weighted provider list, not a launch type
+
+`service_launch_type` is a list of `{capacity_provider, weight}` defaulting to 100% SPOT, rendered both into the service's `capacity_provider_strategy` and into the CodeDeploy appspec's `CapacityProviderStrategy`. A hardcoded `launch_type = "FARGATE"` cannot express a ratio at all, and the appspec needs that same list to describe the replacement task set — one variable feeds both.
+
 <!-- BEGIN_TF_DOCS -->
 ## Requirements
 
